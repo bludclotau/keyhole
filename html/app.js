@@ -1,155 +1,349 @@
-const STORE = "lan-llm-chat-v4";
-const $ = (id) => document.getElementById(id);
-const esc = (s) => String(s).replace(/[&<>]/g, (c) => ({ "&": "&", "<": "<", ">": ">" }[c]));
-const fmt = (s) => esc(s)
-  .replace(/```([\s\S]*?)```/g, (_, c) => `<pre><code>${c}</code></pre>`)
-  .replace(/`([^`]+)`/g, (_, c) => `<code>${c}</code>`)
-  .replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>");
-const nowId = () => `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
-const basename = (id) => String(id || "").split(/[\\/]/).pop();
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+function systemForChat() {
+  const parts = [];
+  if (state.persona && !state.selected.size) {
+    const pre = personaPrompt(state.persona);
+    if (pre) parts.push(pre);
+  } else {
+    const sys = $("system").value.trim();
+    if (sys) parts.push(sys);
+  }
+  if (state.task) parts.push(`Task context: ${state.task}`);
+  if (state.toolContext) parts.push(`Tool result: ${state.toolContext}`);
+  return parts.join("\n\n");
+}
 
-const state = {
-  view: "chat",
-  catalog: { router: {}, nodes: [], personas: {}, tasks: {}, tools: [] },
-  health: {},
-  props: {},
-  slots: {},
-  router: { ok: null, status: "" },
-  selected: new Set(),
-  didPick: false,
-  persona: null,
-  task: "general",
-  threads: [],
-  active: null,
-  abort: null,
-  toolContext: "",
-  toolRaw: null,
+function chatMessages(node, history) {
+  const msgs = [];
+  const sys = systemForChat();
+  if (sys) msgs.push({ role: "system", content: sys });
+  for (const m of history.slice(-24)) {
+    if (m.error || (m.role !== "user" && m.role !== "assistant")) continue;
+    if (m.role === "assistant" && m.node && m.node !== node.id) continue;
+    msgs.push({ role: m.role, content: m.content });
+  }
+  return msgs;
+}
+
+async function streamChat(node, messages, signal, onTok) {
+  const res = await fetch(`/api/nodes/${node.id}/v1/chat/completions`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      model: state.health[node.id]?.model || "local",
+      messages,
+      temperature: Number($("temp").value) || 0.8,
+      max_tokens: Number($("maxTok").value) || 512,
+      stream: true,
+    }),
+    signal,
+  });
+  if (!res.ok) throw new Error(`HTTP ${res.status}: ${(await res.text()).slice(0, 400)}`);
+  const reader = res.body.getReader();
+  const dec = new TextDecoder();
+  let buf = "";
+  let out = "";
+  while (true) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    buf += dec.decode(value, { stream: true });
+    const parts = buf.split("\n");
+    buf = parts.pop();
+    for (const line of parts) {
+      const s = line.trim();
+      if (!s.startsWith("data:")) continue;
+      const payload = s.slice(5).trim();
+      if (payload === "[DONE]") continue;
+      try {
+        const j = JSON.parse(payload);
+        const tok = j.choices?.[0]?.delta?.content || j.choices?.[0]?.text || "";
+        if (tok) {
+          out += tok;
+          onTok(out);
+        }
+      } catch {}
+    }
+  }
+  return out;
+}
+
+async function routeChat(node, userText, signal, uid) {
+  const body = {
+    prompt: userText,
+    persona: state.selected.size ? node.id : (state.persona || node.id),
+    task: state.task,
+    user_id: uid,
+    bot_name: $("routeBot").value.trim() || "lan-chat",
+    n_predict: Number($("maxTok").value) || 512,
+    max_tokens: Number($("maxTok").value) || 512,
+    stream: false,
+  };
+  if (state.toolContext) {
+    body.tool = "web_fetch";
+    body.args = { url: $("toolUrl").value.trim() || "attached" };
+    body.prompt = `Tool result: ${state.toolContext}\n\n${userText}`;
+  }
+  for (let i = 0; i < 4; i++) {
+    const res = await fetch("/api/router/route", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+      signal,
+    });
+    if (!res.ok) throw new Error(`HTTP ${res.status}: ${(await res.text()).slice(0, 400)}`);
+    const j = await res.json();
+    if (j.clean === "Cooldown active.") {
+      await sleep(2100);
+      continue;
+    }
+    return j;
+  }
+  throw new Error("Router cooldown stayed active.");
+}
+
+$("tabs").addEventListener("click", (e) => {
+  const btn = e.target.closest("[data-view]");
+  if (btn) setView(btn.dataset.view);
+});
+
+$("models").addEventListener("click", (e) => {
+  const btn = e.target.closest("[data-model]");
+  if (!btn) return;
+  const id = btn.dataset.model;
+  if (state.health[id] && !state.health[id].ok) return;
+  if (state.selected.has(id)) state.selected.delete(id);
+  else state.selected.add(id);
+  if (state.selected.size) state.persona = null;
+  renderNodes();
+  save();
+});
+
+$("personas").addEventListener("click", (e) => {
+  const btn = e.target.closest("[data-persona]");
+  if (!btn) return;
+  const name = btn.dataset.persona;
+  state.selected.clear();
+  state.persona = state.persona === name ? null : name;
+  renderNodes();
+  save();
+});
+
+$("tasks").addEventListener("click", (e) => {
+  const btn = e.target.closest("[data-task]");
+  if (!btn) return;
+  state.task = btn.dataset.task;
+  renderNodes();
+  save();
+});
+
+$("personaCards").addEventListener("click", (e) => {
+  const btn = e.target.closest("[data-use-persona]");
+  if (!btn) return;
+  state.selected.clear();
+  state.persona = btn.dataset.usePersona;
+  renderNodes();
+  save();
+  setView("chat");
+});
+
+$("threads").addEventListener("click", (e) => {
+  const del = e.target.closest("[data-del]");
+  if (del) {
+    const id = del.dataset.del;
+    state.threads = state.threads.filter((t) => t.id !== id);
+    if (!state.threads.length) newThread(true);
+    else if (state.active === id) state.active = state.threads[0].id;
+    save();
+    renderThreads();
+    renderMessages();
+    return;
+  }
+  const btn = e.target.closest("[data-thread]");
+  if (!btn) return;
+  state.active = btn.dataset.thread;
+  save();
+  renderThreads();
+  renderMessages();
+});
+
+$("newChat").onclick = () => {
+  newThread(true);
+  renderThreads();
+  renderMessages();
 };
 
-function nodeById(id) {
-  return state.catalog.nodes.find((n) => n.id === id);
-}
+$("menu").onclick = () => document.body.classList.toggle("nav");
+$("stop").onclick = () => { if (state.abort) state.abort.abort(); };
+$("system").onchange = save;
+$("maxTok").onchange = save;
+$("temp").onchange = save;
+$("viaRouter").onchange = () => { renderNodes(); save(); };
+$("routeUser").onchange = save;
+$("routeBot").onchange = save;
 
-function personaModel(name) {
-  const p = state.catalog.personas[name];
-  return p && typeof p === "object" ? p.model : p;
-}
-
-function personaPrompt(name) {
-  const p = state.catalog.personas[name];
-  return p && typeof p === "object" ? (p.prompt || "") : "";
-}
-
-function load() {
+$("toolFetch").onclick = async () => {
+  const url = $("toolUrl").value.trim();
+  if (!url) return;
+  $("toolOut").textContent = "fetching…";
+  $("toolFetch").disabled = true;
   try {
-    const raw = JSON.parse(localStorage.getItem(STORE) || "{}");
-    state.threads = Array.isArray(raw.threads) ? raw.threads : [];
-    state.active = raw.active || null;
-    if (raw.system) $("system").value = raw.system;
-    if (raw.maxTok) $("maxTok").value = raw.maxTok;
-    if (raw.temp) $("temp").value = raw.temp;
-    if (raw.viaRouter) $("viaRouter").checked = true;
-    if (Array.isArray(raw.selected)) state.selected = new Set(raw.selected);
-    if (raw.persona) state.persona = raw.persona;
-    if (raw.task) state.task = raw.task;
-    if (raw.routeUser) $("routeUser").value = raw.routeUser;
-    if (raw.routeBot) $("routeBot").value = raw.routeBot;
-    if (raw.threads || raw.selected || raw.persona || raw.task) state.didPick = true;
-  } catch {}
-  if (!state.threads.length) newThread(false);
-  if (!state.active || !state.threads.some((t) => t.id === state.active)) {
-    state.active = state.threads[0].id;
+    const res = await fetch("/api/router/tool", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        tool: "web_fetch",
+        args: { url },
+        user_id: $("routeUser").value.trim() || "lan-chat",
+        bot_name: $("routeBot").value.trim() || "lan-chat",
+      }),
+    });
+    const j = await res.json();
+    state.toolRaw = j;
+    $("toolOut").textContent = JSON.stringify(j, null, 2);
+    const result = j.result || {};
+    if (result.text) state.toolContext = String(result.text).slice(0, 4000);
+    else if (result.error) state.toolContext = "";
+  } catch (err) {
+    $("toolOut").textContent = String(err);
+  } finally {
+    $("toolFetch").disabled = false;
   }
-}
+};
 
-function save() {
-  localStorage.setItem(STORE, JSON.stringify({
-    threads: state.threads,
-    active: state.active,
-    system: $("system").value,
-    maxTok: $("maxTok").value,
-    temp: $("temp").value,
-    viaRouter: $("viaRouter").checked,
-    selected: [...state.selected],
-    persona: state.persona,
-    task: state.task,
-    routeUser: $("routeUser").value,
-    routeBot: $("routeBot").value,
-  }));
-}
+$("toolAttach").onclick = () => {
+  const j = state.toolRaw;
+  const text = j?.result?.text || j?.result?.title || $("toolOut").textContent;
+  state.toolContext = String(text || "").slice(0, 4000);
+  setView("chat");
+};
 
-function thread() {
-  return state.threads.find((t) => t.id === state.active);
-}
-
-function newThread(select = true) {
-  const t = { id: nowId(), title: "New chat", created: Date.now(), messages: [] };
-  state.threads.unshift(t);
-  if (select) state.active = t.id;
-  save();
-  return t;
-}
-
-function targets() {
-  if (state.selected.size) {
-    return [...state.selected].map(nodeById).filter(Boolean);
+$("routeSend").onclick = async () => {
+  const prompt = $("routePrompt").value.trim();
+  if (!prompt) return;
+  $("routeOut").textContent = "routing…";
+  $("routeSend").disabled = true;
+  try {
+    const res = await fetch("/api/router/route", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        prompt,
+        persona: state.persona || (targets()[0] && targets()[0].id) || "qwen",
+        task: state.task,
+        user_id: $("routeUser").value.trim() || "lan-chat",
+        bot_name: $("routeBot").value.trim() || "lan-chat",
+        n_predict: Number($("routeN").value) || 128,
+      }),
+    });
+    const j = await res.json();
+    $("routeOut").textContent = JSON.stringify(j, null, 2);
+  } catch (err) {
+    $("routeOut").textContent = String(err);
+  } finally {
+    $("routeSend").disabled = false;
   }
-  const id = state.persona
-    ? personaModel(state.persona)
-    : state.catalog.tasks[state.task || "general"];
-  const n = nodeById(id);
-  return n ? [n] : [];
-}
+};
 
-function setView(name) {
-  state.view = name;
-  document.querySelectorAll(".tab").forEach((b) => b.classList.toggle("on", b.dataset.view === name));
-  document.querySelectorAll(".view").forEach((v) => v.classList.toggle("on", v.id === `view-${name}`));
-  if (name === "cluster") renderCluster();
-  if (name === "personas") renderPersonaCards();
-}
+$("form").onsubmit = async (e) => {
+  e.preventDefault();
+  const text = $("prompt").value.trim();
+  const t = thread();
+  const nodes = targets().filter((n) => state.health[n.id]?.ok || $("viaRouter").checked);
+  if (!text || !t || state.abort) return;
+  if (!nodes.length) {
+    addLive("error").innerHTML = `<span class="err">No online node selected.</span>`;
+    return;
+  }
+  $("prompt").value = "";
+  t.messages.push({ role: "user", content: text });
+  if (t.title === "New chat") t.title = text.slice(0, 48);
+  renderThreads();
+  renderMessages();
+  const ac = new AbortController();
+  state.abort = ac;
+  $("send").disabled = true;
+  $("stop").disabled = false;
+  const viaRouter = $("viaRouter").checked;
+  const uidBase = $("routeUser").value.trim() || "lan-chat";
+  try {
+    await Promise.all(nodes.map(async (node, i) => {
+      const who = `${node.name} · ${viaRouter ? "router" : node.host}`;
+      const bubble = addLive(who);
+      const started = performance.now();
+      try {
+        if (viaRouter) {
+          const uid = nodes.length > 1 ? `${uidBase}-${node.id}` : uidBase;
+          const j = await routeChat(node, text, ac.signal, uid);
+          const clean = j.clean || j.content || "";
+          const raw = j.raw || clean;
+          const model = j.model || node.id;
+          bubble.classList.remove("typing");
+          bubble.innerHTML = fmt(clean);
+          t.messages.push({
+            role: "assistant",
+            content: clean,
+            raw,
+            who: `${node.name} → ${model}`,
+            node: node.id,
+            model,
+            via: "router",
+            ms: performance.now() - started,
+          });
+        } else {
+          const out = await streamChat(node, chatMessages(node, t.messages), ac.signal, (s) => {
+            bubble.classList.remove("typing");
+            bubble.innerHTML = fmt(s);
+            $("chats").scrollTop = $("chats").scrollHeight;
+          });
+          bubble.classList.remove("typing");
+          bubble.innerHTML = fmt(out);
+          t.messages.push({
+            role: "assistant",
+            content: out,
+            who,
+            node: node.id,
+            model: state.health[node.id]?.model || node.id,
+            via: "direct",
+            ms: performance.now() - started,
+          });
+        }
+        save();
+      } catch (err) {
+        const msg = err.name === "AbortError" ? "stopped" : String(err.message || err);
+        bubble.classList.remove("typing");
+        bubble.innerHTML = `<span class="err">${esc(msg)}</span>`;
+        t.messages.push({
+          role: "assistant",
+          content: msg,
+          who,
+          node: node.id,
+          error: true,
+        });
+      }
+    }));
+  } finally {
+    state.abort = null;
+    $("send").disabled = false;
+    $("stop").disabled = true;
+    renderMessages();
+    save();
+  }
+};
 
-function renderHealth() {
-  const pill = $("healthPill");
-  const nodes = state.catalog.nodes;
-  const online = nodes.filter((n) => state.health[n.id]?.ok);
-  const router = state.router.ok;
-  const parts = [];
-  if (router === true) parts.push("router");
-  else if (router === false) parts.push("router down");
-  if (nodes.length) parts.push(`${online.length}/${nodes.length} nodes`);
-  pill.textContent = parts.join(" · ") || "cluster…";
-  pill.className = `pill${router === false || (nodes.length && !online.length) ? " bad" : online.length || router ? " ok" : ""}`;
-}
+$("prompt").addEventListener("keydown", (e) => {
+  if (e.key === "Enter" && !e.shiftKey) {
+    e.preventDefault();
+    $("form").requestSubmit();
+  }
+});
 
-function renderNodes() {
-  $("models").innerHTML = state.catalog.nodes.map((n) => {
-    const h = state.health[n.id];
-    const slots = state.slots[n.id] || [];
-    const busy = slots.filter((s) => s.is_processing).length;
-    const on = state.selected.has(n.id);
-    const cls = `node${on ? " on" : ""}${h && !h.ok ? " offline" : ""}`;
-    const processing = busy > 0;
-    const dot = !h ? "wait" : !h.ok ? "bad" : processing ? "busy" : "ok";
-    const status = !h ? "checking…" : !h.ok ? "offline" : `${h.model || "ready"}${slots.length ? ` · ${busy}/${slots.length} busy` : ""}`;
-    return `<button class="${cls}" data-model="${esc(n.id)}" type="button">\n      <i class="dot ${dot}"></i>\n      <b>${esc(n.name)}</b>\n      <span>${esc(n.host)} · ${esc(status)}</span>\n    </button>`;
-  }).join("") || `<span class="hint">No nodes in catalog.json</span>`;
-
-  $("personas").innerHTML = Object.entries(state.catalog.personas).map(([name, spec]) => {
-    const model = spec.model || spec;
-    const on = !state.selected.size && state.persona === name;
-    return `<button class="chip${on ? " on" : ""}" data-persona="${esc(name)}" type="button">${esc(name)} <span class="meta">→ ${esc(model)}</span></button>`;
-  }).join("");
-
-  $("tasks").innerHTML = Object.entries(state.catalog.tasks).map(([name, model]) => {
-    const on = state.task === name;
-    return `<button class="chip${on ? " on" : ""}" data-task="${esc(name)}" type="button">${esc(name)} <span class="meta">→ ${esc(model)}</span></button>`;
-  }).join("");
-
-  $("selPills").innerHTML = targets().map((n) => {
-    const via = !state.selected.size && state.persona ? `${state.persona} → ` : "";
-    const path = $("viaRouter").checked ? "router" : "direct";
-    return `<span class="pill">${esc(via + n.name)} · ${path}</span>`;
-  }).join("") || `<span class="pill">no node selected</span>`;
-}
+(async () => {
+  load();
+  renderThreads();
+  renderMessages();
+  renderNodes();
+  renderHealth();
+  try { await loadCatalog(); } catch {}
+  renderPersonaCards();
+  await probe();
+  setInterval(probe, 15000);
+})();
