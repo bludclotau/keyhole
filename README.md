@@ -10,7 +10,9 @@ Live on velma: `http://10.1.1.222:8080/` (also `:8000`, `:8888`, `https://10.1.1
 
 ```
 html/index.html      UI shell
-html/app.js          chat, cluster, personas, tools
+html/core.js         state, persistence, health pill
+html/ui.js           node/persona/cluster render + probes
+html/app.js          streaming chat, /route, /tool
 html/catalog.json    node map + persona prompts (copied from gguf-router)
 nginx/default.conf   reverse proxy
 compose.yaml         nginx:alpine, host network
@@ -53,7 +55,7 @@ Keyhole treats the router repo as the source of truth:
 - `GET /health` — currently `{ "status": "router-ok" }`
 - Persona engine prepends the prompt, injects per-user memory from Postgres, logs `conversations`, 2s cooldown, output cleaner
 
-The UI has four surfaces: **Chat** (direct stream, optional “send via /route”), **Cluster** (node props/slots + router health), **Personas** (full prompts), **Tools** (web_fetch + a /route lab).
+The UI has four surfaces: **Chat** (direct stream, optional send via /route), **Cluster** (node props/slots + router health), **Personas** (full prompts), **Tools** (web_fetch + a /route lab).
 
 ## Ask of the gguf-router maintainer
 
