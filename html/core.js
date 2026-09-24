@@ -111,6 +111,7 @@ function setView(name) {
   document.querySelectorAll(".view").forEach((v) => v.classList.toggle("on", v.id === `view-${name}`));
   if (name === "cluster") renderCluster();
   if (name === "personas") renderPersonaCards();
+  if (name === "wendy" && typeof refreshWendy === "function") refreshWendy();
 }
 
 function renderHealth() {
