@@ -66,6 +66,18 @@ async function streamChat(node, messages, signal, onTok) {
   return out;
 }
 
+async function pollRouteJob(jobId, signal) {
+  const started = Date.now();
+  while (Date.now() - started < 180000) {
+    const res = await fetch(`/api/router/route/jobs/${jobId}`, { signal });
+    if (!res.ok) throw new Error(`job HTTP ${res.status}`);
+    const job = await res.json();
+    if (job.followup) return job.followup;
+    await sleep(1500);
+  }
+  return "Still looking. Check the Wendy tab in a moment.";
+}
+
 async function routeChat(node, userText, signal, uid) {
   const body = {
     prompt: userText,
@@ -466,6 +478,20 @@ $("form").onsubmit = async (e) => {
             via: "router",
             ms: performance.now() - started,
           });
+          if (j.dispatched && j.job_id) {
+            const followBubble = addLive(`${who} · follow-up`);
+            const follow = await pollRouteJob(j.job_id, ac.signal);
+            followBubble.classList.remove("typing");
+            followBubble.innerHTML = fmt(follow);
+            t.messages.push({
+              role: "assistant",
+              content: follow,
+              who: `${node.name} → follow-up`,
+              node: node.id,
+              model,
+              via: "router",
+            });
+          }
         } else {
           const out = await streamChat(node, chatMessages(node, t.messages), ac.signal, (s) => {
             bubble.classList.remove("typing");

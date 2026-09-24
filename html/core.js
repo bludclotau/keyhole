@@ -52,7 +52,7 @@ function load() {
     if (raw.system) $("system").value = raw.system;
     if (raw.maxTok) $("maxTok").value = raw.maxTok;
     if (raw.temp) $("temp").value = raw.temp;
-    if (raw.viaRouter) $("viaRouter").checked = true;
+    if (typeof raw.viaRouter === "boolean") $("viaRouter").checked = raw.viaRouter;
     if (Array.isArray(raw.selected)) state.selected = new Set(raw.selected);
     if (raw.persona) state.persona = raw.persona;
     if (raw.task) state.task = raw.task;
